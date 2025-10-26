@@ -1,20 +1,27 @@
 #!/bin/bash
 
 # Xray Reality 管理脚本
-# 版本: 2.0.0
+# 版本: 2.0.4-mod-final
 # 最后更新: 2025-10-26
 # by fs (修复 curl | bash 时的 read 问题)
 # 针对 Debian 13 优化, 默认端口 8443, 增加 BBR 及系统优化
+# v2.0.1: 增强了 xray uuid 和 x25519 命令的错误捕获
+# v2.0.2: 适配新版 xray x25519 的输出格式 (PrivateKey: 和 Password:), 修复公钥解析失败的问题
+# v2.0.2-mod: 修复双栈VPS获取IP的问题, 默认提供 v4 和 v6 两个链接
+# v2.0.3-mod-gai: 增加设置服务器 IP 栈优先级 (v4/v6) 的功能
+# v2.0.4-mod-final: 修正 "listen" 地址为 "::" (实现真正的双栈监听), 修正 "bittorrent" 拼写错误
 
 # --- 全局常量和默认值 ---
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.0.4-mod-final"
 DEFAULT_SNI="genshin.hoyoverse.com"
-DEFAULT_LISTEN_PORT_OPTION1="8443" # <--- 已按要求修改为 8443
+DEFAULT_LISTEN_PORT_OPTION1="8443"
 DEFAULT_FP_OPTION="chrome"
 AVAILABLE_FPS=("chrome" "firefox" "safari" "edge" "ios" "android" "random")
 
 STATE_FILE_DIR="/etc/xray_reality_manager"
 STATE_FILE="${STATE_FILE_DIR}/install_details.json"
+GAI_CONF_FILE="/etc/gai.conf"
+IPV4_PRECEDENCE_LINE="precedence ::ffff:0:0/96 100"
 
 XRAY_INSTALL_PATH="/usr/local/bin/xray"
 XRAY_CONFIG_PATH="/usr/local/etc/xray"
@@ -26,7 +33,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
-NC='\033[0m'
+NC='\033[0;33m'
 
 # --- 基础函数 ---
 check_root() {
@@ -100,7 +107,7 @@ install_dependencies() {
     return 0
 }
 
-# --- 新增：系统优化函数 ---
+# --- 系统优化函数 ---
 enable_system_optimizations() {
     echo -e "\n${BLUE}--- 正在应用系统优化 (BBR, TCP, 文件描述符) ---${NC}"
     local sysctl_conf="/etc/sysctl.conf"
@@ -265,25 +272,63 @@ get_user_input_no_xray_deps() {
     return 0
 }
 
+# --- v2.0.2: 适配新版 xray x25519 输出 (PrivateKey: 和 Password:) ---
 generate_reality_keys_interactive() {
     echo -e "\n${BLUE}正在生成 Reality 密钥对...${NC}"
-    if ! command -v $XRAY_INSTALL_PATH &> /dev/null || [[ ! -x "$XRAY_INSTALL_PATH" ]]; then echo -e "${RED}错误: Xray 命令 ($XRAY_INSTALL_PATH) 未找到或不可执行.${NC}"; return 1; fi
-    local key_pair_output; key_pair_output=$($XRAY_INSTALL_PATH x25519)
-    final_private_key=$(echo "$key_pair_output" | grep "Private key:" | awk '{print $3}')
-    final_public_key=$(echo "$key_pair_output" | grep "Public key:" | awk '{print $3}')
-    if [[ -z "$final_private_key" || -z "$final_public_key" ]]; then echo -e "${RED}错误: 生成 Reality 密钥对失败.${NC}"; return 1; fi
-    echo -e "${GREEN}Reality 密钥对生成成功.${NC}"; return 0
+    if ! command -v $XRAY_INSTALL_PATH &> /dev/null || [[ ! -x "$XRAY_INSTALL_PATH" ]]; then 
+        echo -e "${RED}错误: Xray 命令 ($XRAY_INSTALL_PATH) 未找到或不可执行.${NC}"; 
+        return 1; 
+    fi
+    
+    local key_pair_output
+    # 捕获 stdout 和 stderr (2>&1)
+    key_pair_output=$($XRAY_INSTALL_PATH x25519 2>&1)
+    local exit_code=$? # 获取命令的退出状态码
+
+    if [[ $exit_code -ne 0 ]]; then
+         echo -e "${RED}错误: 'xray x25519' 命令执行失败. 退出码: $exit_code${NC}"
+         echo -e "${YELLOW}Xray 错误详情:${NC}"
+         echo -e "${RED}---(START)---${NC}"
+         echo "$key_pair_output"
+         echo -e "${RED}---(END)---${NC}"
+         return 1
+    fi
+
+    # 适配新版 (PrivateKey:) 和旧版 (Private key:)
+    final_private_key=$(echo "$key_pair_output" | grep -i "PrivateKey:" | awk '{print $NF}')
+    
+    # 适配新版 (Password:) 和旧版 (Public key:)
+    # 新版 xray x25519 输出的 'Password' 字段即为客户端所需的 'pbk' (公钥)
+    final_public_key=$(echo "$key_pair_output" | grep -i "Password:" | awk '{print $NF}')
+    if [[ -z "$final_public_key" ]]; then
+        # 如果找不到 Password:, 尝试找 Public key:
+        final_public_key=$(echo "$key_pair_output" | grep -i "Public key:" | awk '{print $NF}')
+    fi
+    
+    if [[ -z "$final_private_key" || -z "$final_public_key" ]]; then 
+        echo -e "${RED}错误: 生成 Reality 密钥对失败. (无法从命令输出中解析私钥或公钥).${NC}"
+        echo -e "${YELLOW}Xray 命令 ($XRAY_INSTALL_PATH x25519) 的原始输出为:${NC}"
+        echo -e "${YELLOW}---(START)---${NC}"
+        echo "$key_pair_output"
+        echo -e "${YELLOW}---(END)---${NC}"
+        return 1; 
+    fi
+    
+    echo -e "${GREEN}Reality 密钥对生成成功.${NC}"; 
+    return 0
 }
 
 create_xray_config_interactive() {
     echo -e "\n${BLUE}正在创建 Xray 配置文件: $XRAY_CONFIG_FILE ${NC}"
     mkdir -p "$XRAY_CONFIG_PATH"
     # 使用"最佳配置": vless + xtls-rprx-vision + reality
+    # v2.0.4 修正: "listen" 必须为 "::" 才能同时监听 v4 和 v6
+    # v2.0.4 修正: "bittrent" -> "bittorrent"
     cat << EOF > "$XRAY_CONFIG_FILE"
 {
   "log": {"loglevel": "warning"}, 
   "routing": {"domainStrategy": "AsIs", "rules": [{"type": "field", "outboundTag": "direct", "protocol": ["bittorrent"]}, {"type": "field", "outboundTag": "block", "protocol": ["stun", "quic"]}]},
-  "inbounds": [{"listen": "0.0.0.0", "port": ${final_listen_port}, "protocol": "vless", "settings": {"clients": [{"id": "${final_user_uuid}", "flow": "xtls-rprx-vision"}], "decryption": "none"}, "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {"show": false, "dest": "${final_dest_server}", "xver": 0, "serverNames": ["${final_sni}"], "privateKey": "${final_private_key}", "minClientVer": "", "maxClientVer": "", "maxTimeDiff": 60000, "shortIds": [${final_short_id_for_config_array}]}}, "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}}],
+  "inbounds": [{"listen": "::", "port": ${final_listen_port}, "protocol": "vless", "settings": {"clients": [{"id": "${final_user_uuid}", "flow": "xtls-rprx-vision"}], "decryption": "none"}, "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {"show": false, "dest": "${final_dest_server}", "xver": 0, "serverNames": ["${final_sni}"], "privateKey": "${final_private_key}", "minClientVer": "", "maxClientVer": "", "maxTimeDiff": 60000, "shortIds": [${final_short_id_for_config_array}]}}, "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}}],
   "outbounds": [{"protocol": "freedom", "tag": "direct"}, {"protocol": "blackhole", "tag": "block"}]
 }
 EOF
@@ -321,22 +366,53 @@ EOF
 }
 
 display_client_config_info() {
-    local disp_pub_ip="$1" disp_port="$2" disp_uuid="$3" disp_sni="$4" disp_fp="$5" disp_pbk="$6" disp_sid="$7" disp_dest="$8"
-    local node_name="Reality_${disp_pub_ip}"
-    if [[ "$disp_pub_ip" == "YOUR_SERVER_IP" ]]; then echo -e "${YELLOW}警告: 无法自动获取公网 IP 地址. 请手动替换下面链接中的 'YOUR_SERVER_IP'.${NC}"; fi
-    echo -e "\n${BLUE}==================== 客户端配置信息 ====================${NC}"
-    echo -e "协议 (Protocol): ${GREEN}VLESS${NC}" ; echo -e "地址 (Address): ${GREEN}${disp_pub_ip}${NC}" ; echo -e "端口 (Port): ${GREEN}${disp_port}${NC}"
-    echo -e "用户ID (UUID): ${GREEN}${disp_uuid}${NC}" ; echo -e "流控 (Flow): ${GREEN}xtls-rprx-vision${NC}" ; echo -e "加密 (Encryption): ${GREEN}none${NC}"
-    echo -e "传输协议 (Network): ${GREEN}tcp${NC}" ; echo -e "伪装类型 (Type): ${GREEN}none${NC}" ; echo -e "安全类型 (Security): ${GREEN}reality${NC}"
-    echo -e "SNI (ServerName / host): ${GREEN}${disp_sni}${NC}" ; echo -e "公钥 (PublicKey / pbk): ${GREEN}${disp_pbk}${NC}"
-    echo -e "Short ID (sid): ${GREEN}${disp_sid}${NC}" ; echo -e "指纹 (Fingerprint / fp): ${GREEN}${disp_fp}${NC}"
+    # 接收 v4 和 v6 IP
+    local disp_pub_ip_v4="$1" disp_pub_ip_v6="$2" disp_port="$3" disp_uuid="$4" disp_sni="$5" disp_fp="$6" disp_pbk="$7" disp_sid="$8" disp_dest="$9"
+    
+    # 默认使用 IPv4
+    local node_name_v4="Reality_v4_${disp_pub_ip_v4}"
+    
+    # 警告
+    if [[ "$disp_pub_ip_v4" == "YOUR_SERVER_IPV4" ]]; then 
+        echo -e "${YELLOW}警告: 无法自动获取公网 IPv4 地址. 请手动替换下面链接中的 'YOUR_SERVER_IPV4'.${NC}"
+    fi
+    if [[ -n "$disp_pub_ip_v6" ]]; then
+         echo -e "${BLUE}检测到 IPv6 地址: $disp_pub_ip_v6 ${NC}"
+    else
+         echo -e "${YELLOW}未检测到或获取公网 IPv6 地址失败.${NC}"
+    fi
+
+    echo -e "\n${BLUE}==================== 客户端配置信息 (IPv4 优先) ====================${NC}"
+    echo -e "协议 (Protocol): ${GREEN}VLESS${NC}"
+    echo -e "地址 (Address): ${GREEN}${disp_pub_ip_v4}${NC}" # 优先显示 V4
+    echo -e "端口 (Port): ${GREEN}${disp_port}${NC}"
+    echo -e "用户ID (UUID): ${GREEN}${disp_uuid}${NC}"
+    echo -e "流控 (Flow): ${GREEN}xtls-rprx-vision${NC}"
+    echo -e "加密 (Encryption): ${GREEN}none${NC}"
+    echo -e "传输协议 (Network): ${GREEN}tcp${NC}"
+    echo -e "伪装类型 (Type): ${GREEN}none${NC}"
+    echo -e "安全类型 (Security): ${GREEN}reality${NC}"
+    echo -e "SNI (ServerName / host): ${GREEN}${disp_sni}${NC}"
+    echo -e "公钥 (PublicKey / pbk): ${GREEN}${disp_pbk}${NC}"
+    echo -e "Short ID (sid): ${GREEN}${disp_sid}${NC}"
+    echo -e "指纹 (Fingerprint / fp): ${GREEN}${disp_fp}${NC}"
     echo -e "Reality目标 (dest - 服务器参数): ${YELLOW}${disp_dest}${NC}"
-    echo -e "\n${BLUE}以下是您的 VLESS Reality 订阅链接 (分享链接):${NC}"
-    echo -e "${BLUE}请复制完整的链接并在您的客户端中导入:${NC}"
-    echo -e "${GREEN}vless://${disp_uuid}@${disp_pub_ip}:${disp_port}?encryption=none&security=reality&sni=${disp_sni}&fp=${disp_fp}&pbk=${disp_pbk}&sid=${disp_sid}&type=tcp&flow=xtls-rprx-vision#${node_name}${NC}"
-    echo -e "\n${YELLOW}请注意: 如果您的服务器位于 NAT 后或有防火墙, 请确保端口 ${disp_port} 已正确放行 TCP 流量.${NC}"
-    echo -e "${BLUE}========================================================${NC}"
+    
+    echo -e "\n${BLUE}--- VLESS Reality 订阅链接 (IPv4) ---${NC}"
+    echo -e "${GREEN}vless://${disp_uuid}@${disp_pub_ip_v4}:${disp_port}?encryption=none&security=reality&sni=${disp_sni}&fp=${disp_fp}&pbk=${disp_pbk}&sid=${disp_sid}&type=tcp&flow=xtls-rprx-vision#${node_name_v4}${NC}"
+
+    # 检查 V6
+    if [[ -n "$disp_pub_ip_v6" ]]; then
+        # IPv6 地址在 URL 中需要用 [] 括起来
+        local node_name_v6="Reality_v6_[${disp_pub_ip_v6}]"
+        echo -e "\n${BLUE}--- VLESS Reality 订阅链接 (IPv6) ---${NC}"
+        echo -e "${GREEN}vless://${disp_uuid}@[${disp_pub_ip_v6}]:${disp_port}?encryption=none&security=reality&sni=${disp_sni}&fp=${disp_fp}&pbk=${disp_pbk}&sid=${disp_sid}&type=tcp&flow=xtls-rprx-vision#${node_name_v6}${NC}"
+    fi
+
+    echo -e "\n${YELLOW}请注意: 如果您的服务器位于 NAT 后或有防火墙, 请确保端口 ${disp_port} 已正确放行 TCP 流量 (IPv4 和/或 IPv6).${NC}"
+    echo -e "${BLUE}===============================================================${NC}"
 }
+
 
 # --- 菜单功能实现 ---
 install_reality() {
@@ -372,13 +448,20 @@ install_reality() {
     check_os_compatibility || { return; }
     install_dependencies || { echo -e "${RED}依赖安装失败, 中止安装.${NC}"; return; }
     
-    # --- 新增：自动应用系统优化 ---
+    # --- 自动应用系统优化 ---
     enable_system_optimizations || { echo -e "${YELLOW}系统优化步骤出现问题, 但安装将继续...${NC}"; }
     
     install_xray_core || { echo -e "${RED}Xray核心安装失败, 中止安装.${NC}"; return; }
 
+    # --- v2.0.1: 增强了 UUID 生成的错误捕获 ---
     if [[ "$final_user_uuid_placeholder" == "AUTO_GENERATE" ]]; then
-        final_user_uuid=$($XRAY_INSTALL_PATH uuid); echo -e "${GREEN}已自动生成 UUID: $final_user_uuid${NC}"
+        final_user_uuid=$($XRAY_INSTALL_PATH uuid 2>&1)
+        if [[ $? -ne 0 || -z "$final_user_uuid" || "$final_user_uuid" == *error* ]]; then
+            echo -e "${RED}错误: 'xray uuid' 命令执行失败.${NC}"
+            echo -e "${YELLOW}Xray 错误详情: $final_user_uuid${NC}"
+            return 1
+        fi
+        echo -e "${GREEN}已自动生成 UUID: $final_user_uuid${NC}"
     else
         final_user_uuid=$final_user_uuid_placeholder; echo -e "${GREEN}UUID 设置为: $final_user_uuid${NC}"
     fi
@@ -401,8 +484,13 @@ install_reality() {
 
     save_install_details "$final_sni" "$final_listen_port" "$final_user_uuid" "$final_short_id_for_link" "$final_public_key" "$final_fingerprint" "$final_dest_server"
 
-    local public_ip_addr; public_ip_addr=$(curl -s --max-time 5 ip.sb || curl -s --max-time 5 ifconfig.me || curl -s --max-time 5 api.ipify.org || echo "YOUR_SERVER_IP")
-    display_client_config_info "$public_ip_addr" "$final_listen_port" "$final_user_uuid" "$final_sni" "$final_fingerprint" "$final_public_key" "$final_short_id_for_link" "$final_dest_server"
+    local public_ip_v4; local public_ip_v6
+    public_ip_v4=$(curl -4 -s --max-time 5 ip.sb || curl -4 -s --max-time 5 ifconfig.me || curl -4 -s --max-time 5 api.ipify.org)
+    public_ip_v6=$(curl -6 -s --max-time 5 ip.sb || curl -6 -s --max-time 5 ifconfig.me || curl -6 -s --max-time 5 api6.ipify.org)
+    if [[ -z "$public_ip_v4" ]]; then public_ip_v4="YOUR_SERVER_IPV4"; fi
+    if [[ -z "$public_ip_v6" ]]; then public_ip_v6=""; fi
+    display_client_config_info "$public_ip_v4" "$public_ip_v6" "$final_listen_port" "$final_user_uuid" "$final_sni" "$final_fingerprint" "$final_public_key" "$final_short_id_for_link" "$final_dest_server"
+    
     echo -e "\n${GREEN}Reality 代理节点安装/配置完成!${NC}"
 }
 
@@ -416,8 +504,13 @@ view_configuration() {
     local stored_fingerprint=$(jq -r '.fingerprint // empty' "$STATE_FILE"); local stored_dest_server=$(jq -r '.dest_server // empty' "$STATE_FILE")
 
     if [[ -z "$stored_sni" || -z "$stored_listen_port" || -z "$stored_uuid" || -z "$stored_public_key" ]]; then echo -e "${RED}错误: 存储的配置信息不完整. 可能需要重新配置.${NC}"; return; fi
-    local public_ip_addr; public_ip_addr=$(curl -s --max-time 5 ip.sb || curl -s --max-time 5 ifconfig.me || curl -s --max-time 5 api.ipify.org || echo "YOUR_SERVER_IP")
-    display_client_config_info "$public_ip_addr" "$stored_listen_port" "$stored_uuid" "$stored_sni" "$stored_fingerprint" "$stored_public_key" "$stored_short_id" "$stored_dest_server"
+    
+    local public_ip_v4; local public_ip_v6
+    public_ip_v4=$(curl -4 -s --max-time 5 ip.sb || curl -4 -s --max-time 5 ifconfig.me || curl -4 -s --max-time 5 api.ipify.org)
+    public_ip_v6=$(curl -6 -s --max-time 5 ip.sb || curl -6 -s --max-time 5 ifconfig.me || curl -6 -s --max-time 5 api6.ipify.org)
+    if [[ -z "$public_ip_v4" ]]; then public_ip_v4="YOUR_SERVER_IPV4"; fi
+    if [[ -z "$public_ip_v6" ]]; then public_ip_v6=""; fi
+    display_client_config_info "$public_ip_v4" "$public_ip_v6" "$stored_listen_port" "$stored_uuid" "$stored_sni" "$stored_fingerprint" "$stored_public_key" "$stored_short_id" "$stored_dest_server"
 }
 
 modify_configuration() {
@@ -447,8 +540,15 @@ modify_configuration() {
     echo -e "\n${BLUE}正在应用修改...${NC}"
     install_xray_core || { echo -e "${RED}Xray核心更新失败, 中止修改.${NC}"; return; } # 确保 Xray 是最新的
 
+    # --- v2.0.1: 增强了 UUID 生成的错误捕获 ---
     if [[ "$final_user_uuid_placeholder" == "AUTO_GENERATE" ]]; then
-        final_user_uuid=$($XRAY_INSTALL_PATH uuid); echo -e "${GREEN}已自动生成 UUID: $final_user_uuid${NC}"
+        final_user_uuid=$($XRAY_INSTALL_PATH uuid 2>&1)
+        if [[ $? -ne 0 || -z "$final_user_uuid" || "$final_user_uuid" == *error* ]]; then
+            echo -e "${RED}错误: 'xray uuid' 命令执行失败.${NC}"
+            echo -e "${YELLOW}Xray 错误详情: $final_user_uuid${NC}"
+            return 1
+        fi
+        echo -e "${GREEN}已自动生成 UUID: $final_user_uuid${NC}"
     else
         final_user_uuid=$final_user_uuid_placeholder; echo -e "${GREEN}UUID 设置为: $final_user_uuid${NC}"
     fi
@@ -468,9 +568,15 @@ modify_configuration() {
     generate_reality_keys_interactive || { echo -e "${RED}密钥生成失败, 中止修改.${NC}"; return; }
     create_xray_config_interactive || { echo -e "${RED}配置文件创建失败, 中止修改.${NC}"; return; }
     setup_systemd_service_interactive || { echo -e "${RED}服务设置失败, 中止修改.${NC}"; return; }
+    
     save_install_details "$final_sni" "$final_listen_port" "$final_user_uuid" "$final_short_id_for_link" "$final_public_key" "$final_fingerprint" "$final_dest_server"
-    local public_ip_addr; public_ip_addr=$(curl -s --max-time 5 ip.sb || curl -s --max-time 5 ifconfig.me || curl -s --max-time 5 api.ipify.org || echo "YOUR_SERVER_IP")
-    display_client_config_info "$public_ip_addr" "$final_listen_port" "$final_user_uuid" "$final_sni" "$final_fingerprint" "$final_public_key" "$final_short_id_for_link" "$final_dest_server"
+    local public_ip_v4; local public_ip_v6
+    public_ip_v4=$(curl -4 -s --max-time 5 ip.sb || curl -4 -s --max-time 5 ifconfig.me || curl -4 -s --max-time 5 api.ipify.org)
+    public_ip_v6=$(curl -6 -s --max-time 5 ip.sb || curl -6 -s --max-time 5 ifconfig.me || curl -6 -s --max-time 5 api6.ipify.org)
+    if [[ -z "$public_ip_v4" ]]; then public_ip_v4="YOUR_SERVER_IPV4"; fi
+    if [[ -z "$public_ip_v6" ]]; then public_ip_v6=""; fi
+    display_client_config_info "$public_ip_v4" "$public_ip_v6" "$final_listen_port" "$final_user_uuid" "$final_sni" "$final_fingerprint" "$final_public_key" "$final_short_id_for_link" "$final_dest_server"
+    
     echo -e "\n${GREEN}Reality 配置修改完成!${NC}"
 }
 
@@ -502,6 +608,72 @@ uninstall_reality() {
     if [[ "$delete_script_choice" =~ ^[Yy]$ ]]; then echo -e "${YELLOW}正在删除管理脚本...${NC}"; rm -- "$0"; echo -e "${GREEN}管理脚本已删除. 再见!${NC}"; fi
 }
 
+# --- 新增功能: 管理 IP 栈优先级 ---
+manage_ip_priority() {
+    echo -e "\n${BLUE}--- 管理服务器 IP 栈优先级 ---${NC}"
+    echo -e "此功能通过修改 ${GAI_CONF_FILE} 来控制系统默认是优先使用 IPv4 还是 IPv6."
+    echo -e "这会影响如 curl, apt, Xray出站等程序的默认网络行为."
+
+    local current_status="${GREEN}优先 IPv6 (系统默认)${NC}"
+    if [ -f "$GAI_CONF_FILE" ] && grep -qE "^[[:space:]]*${IPV4_PRECEDENCE_LINE}" "$GAI_CONF_FILE"; then
+        current_status="${YELLOW}优先 IPv4${NC}"
+    fi
+
+    echo -e "\n当前状态: ${current_status}"
+    echo -e "---------------------------------------------"
+    echo -e "   1) 设置为: ${YELLOW}优先 IPv4${NC}"
+    echo -e "   2) 设置为: ${GREEN}优先 IPv6 (系统默认)${NC}"
+    echo -e "   0) 返回主菜单"
+    echo -e "---------------------------------------------"
+    read -rp "请输入选项 [0-2]: " gai_choice </dev/tty
+
+    case $gai_choice in
+        1)
+            echo -e "${YELLOW}正在设置为 [优先 IPv4]...${NC}"
+            if ! [ -f "$GAI_CONF_FILE" ]; then
+                echo -e "${BLUE}文件 ${GAI_CONF_FILE} 不存在, 正在创建...${NC}"
+                touch "$GAI_CONF_FILE"
+            fi
+            
+            # 检查是否被注释
+            if grep -qE "^[[:space:]]*#[[:space:]]*${IPV4_PRECEDENCE_LINE}" "$GAI_CONF_FILE"; then
+                echo -e "${BLUE}在 ${GAI_CONF_FILE} 中找到已注释的行, 正在取消注释...${NC}"
+                sed -i -E "s/^[[:space:]]*#[[:space:]]*${IPV4_PRECEDENCE_LINE}/${IPV4_PRECEDENCE_LINE}/" "$GAI_CONF_FILE"
+            # 检查是否已存在且未被注释
+            elif grep -qE "^[[:space:]]*${IPV4_PRECEDENCE_LINE}" "$GAI_CONF_FILE"; then
+                echo -e "${GREEN}设置已生效, 无需更改.${NC}"
+            # 如果不存在, 则添加
+            else
+                echo -e "${BLUE}正在向 ${GAI_CONF_FILE} 添加 IPv4 优先规则...${NC}"
+                echo "${IPV4_PRECEDENCE_LINE}" >> "$GAI_CONF_FILE"
+            fi
+            echo -e "${GREEN}设置 [优先 IPv4] 完成.${NC}"
+            ;;
+        2)
+            echo -e "${YELLOW}正在设置为 [优先 IPv6 (系统默认)]...${NC}"
+            if [ -f "$GAI_CONF_FILE" ]; then
+                # 检查是否存在未注释的行, 如果有, 则注释它
+                if grep -qE "^[[:space:]]*${IPV4_PRECEDENCE_LINE}" "$GAI_CONF_FILE"; then
+                    echo -e "${BLUE}正在 ${GAI_CONF_FILE} 中注释 IPv4 优先规则...${NC}"
+                    sed -i -E "s/^[[:space:]]*${IPV4_PRECEDENCE_LINE}/#${IPV4_PRECEDENCE_LINE}/" "$GAI_CONF_FILE"
+                    echo -e "${GREEN}设置 [优先 IPv6 (系统默认)] 完成.${NC}"
+                else
+                    echo -e "${GREEN}系统已处于默认状态, 无需更改.${NC}"
+                fi
+            else
+                echo -e "${GREEN}系统已处于默认状态 (文件不存在), 无需更改.${NC}"
+            fi
+            ;;
+        0)
+            echo -e "${BLUE}返回主菜单...${NC}"
+            ;;
+        *)
+            echo -e "${RED}无效选项!${NC}"; sleep 2;
+            ;;
+    esac
+}
+
+
 # --- 主菜单 ---
 main_menu() {
     clear
@@ -526,10 +698,11 @@ main_menu() {
     echo -e "   ${GREEN}3)${NC} 修改 Reality 配置"
     echo -e "   ${YELLOW}4)${NC} 应用系统优化 (BBR等)"
     echo -e "   ${RED}5)${NC} 卸载 Reality 代理"
+    echo -e "   ${BLUE}6)${NC} 设置服务器IP栈优先级 (v4/v6)"
     echo -e "---------------------------------------------"
     echo -e "   ${YELLOW}0)${NC} 退出脚本"
     echo -e "---------------------------------------------"
-    read -rp "请输入选项 [0-5]: " choice </dev/tty # <--- 强制从TTY读取
+    read -rp "请输入选项 [0-6]: " choice </dev/tty # <--- 强制从TTY读取
 
     local post_action_pause=false 
 
@@ -537,9 +710,10 @@ main_menu() {
         1) install_reality; post_action_pause=true ;; 
         2) view_configuration; post_action_pause=true ;; 
         3) modify_configuration; post_action_pause=true ;;
-        4) enable_system_optimizations; post_action_pause=true ;; # <--- 新增
-        5) uninstall_reality; post_action_pause=true ;; # <--- 编号+1
-        0) echo -e "${GREEN}感谢使用, 正在退出...${NC}"; exit 0 ;;
+        4) enable_system_optimizations; post_action_pause=true ;;
+        5) uninstall_reality; post_action_pause=true ;;
+        6) manage_ip_priority; post_action_pause=true ;;
+        0) echo -e "${GREEN}感谢使用, 真正退出...${NC}"; exit 0 ;;
         *) 
             echo -e "${RED}无效选项! 请重新输入.${NC}"; sleep 2;
             main_menu 
