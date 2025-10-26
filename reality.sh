@@ -1,14 +1,15 @@
 #!/bin/bash
 
 # Xray Reality 管理脚本
-# 版本: 1.0.3
-# 最后更新: 2025-05-09
-# by fs (修复了 curl | bash 时的 read 问题)
+# 版本: 2.0.0
+# 最后更新: 2025-10-26
+# by fs (修复 curl | bash 时的 read 问题)
+# 针对 Debian 13 优化, 默认端口 8443, 增加 BBR 及系统优化
 
 # --- 全局常量和默认值 ---
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="2.0.0"
 DEFAULT_SNI="genshin.hoyoverse.com"
-DEFAULT_LISTEN_PORT_OPTION1="443"
+DEFAULT_LISTEN_PORT_OPTION1="8443" # <--- 已按要求修改为 8443
 DEFAULT_FP_OPTION="chrome"
 AVAILABLE_FPS=("chrome" "firefox" "safari" "edge" "ios" "android" "random")
 
@@ -42,7 +43,7 @@ check_os_compatibility() {
         OS=$NAME
         VER=$VERSION_ID
         if [[ "$ID" == "debian" || "$ID_LIKE" == "debian" || "$ID" == "ubuntu" || "$ID_LIKE" == "ubuntu" ]]; then
-            echo -e "${GREEN}操作系统 ($OS $VER) 兼容.${NC}"
+            echo -e "${GREEN}操作系统 ($OS $VER) 兼容 (支持 Debian 13+ / Ubuntu 22+).${NC}"
             return 0
         else
             echo -e "${RED}错误: 当前操作系统 ($OS $VER) 不受支持. 此脚本仅支持 Debian/Ubuntu 及其衍生系统.${NC}"
@@ -71,8 +72,8 @@ install_dependencies() {
         echo -e "${GREEN}软件包列表更新成功.${NC}"
     fi
 
-    echo -e "${BLUE}正在检查并安装依赖 (curl, unzip, openssl, socat, shuf, jq)...${NC}"
-    local deps=("curl" "unzip" "openssl" "socat" "shuf" "jq")
+    echo -e "${BLUE}正在检查并安装依赖 (curl, unzip, openssl, socat, jq)...${NC}"
+    local deps=("curl" "unzip" "openssl" "socat" "jq") # shuf 包含在 coreutils 中
     local missing_deps=()
     for dep in "${deps[@]}"; do
         if ! command -v "$dep" &> /dev/null; then
@@ -96,6 +97,72 @@ install_dependencies() {
     else
         echo -e "${GREEN}所有依赖已满足.${NC}"
     fi
+    return 0
+}
+
+# --- 新增：系统优化函数 ---
+enable_system_optimizations() {
+    echo -e "\n${BLUE}--- 正在应用系统优化 (BBR, TCP, 文件描述符) ---${NC}"
+    local sysctl_conf="/etc/sysctl.conf"
+    local limits_conf="/etc/security/limits.conf"
+    local optimizations_applied=false
+    local limits_applied=false
+
+    # BBR 和 TCP 优化
+    local sysctl_settings=(
+        "net.core.default_qdisc=fq"
+        "net.ipv4.tcp_congestion_control=bbr"
+        "net.ipv4.tcp_fastopen=3"
+        "net.ipv4.tcp_tw_reuse=1"
+        "net.ipv4.tcp_fin_timeout=30"
+        "net.ipv4.ip_local_port_range=10000 65000"
+    )
+    
+    # 检查并应用 sysctl 设置
+    echo -e "${BLUE}正在配置 BBR 和 TCP 参数...${NC}"
+    for setting in "${sysctl_settings[@]}"; do
+        if ! grep -qF "$setting" "$sysctl_conf"; then
+            echo "$setting" >> "$sysctl_conf"
+            optimizations_applied=true
+        fi
+    done
+
+    if $optimizations_applied; then
+        echo -e "${GREEN}Sysctl 配置已更新. 正在应用...${NC}"
+        if sysctl -p &>/dev/null; then
+            echo -e "${GREEN}Sysctl 设置已成功应用.${NC}"
+        else
+            echo -e "${YELLOW}Sysctl 设置应用失败. 可能需要重启.${NC}"
+        fi
+    else
+        echo -e "${GREEN}Sysctl (BBR等) 设置已是最新.${NC}"
+    fi
+
+    # 文件描述符限制
+    echo -e "${BLUE}正在配置文件描述符限制...${NC}"
+    local limit_settings=(
+        "* soft nofile 65536"
+        "* hard nofile 1048576"
+        "root soft nofile 65536"
+        "root hard nofile 1048576"
+    )
+
+    for setting in "${limit_settings[@]}"; do
+        if ! grep -qF "$setting" "$limits_conf"; then
+            echo "$setting" >> "$limits_conf"
+            limits_applied=true
+        fi
+    done
+
+    if $limits_applied; then
+        echo -e "${GREEN}文件描述符限制 (/etc/security/limits.conf) 已更新.${NC}"
+        echo -e "${YELLOW}注意: limits.conf 的更改需要您重新登录 (re-login) 才能对您的 shell 生效.${NC}"
+        echo -e "${BLUE}(Xray 服务将通过 systemd 配置获得高限制, 不受此影响)${NC}"
+    else
+        echo -e "${GREEN}文件描述符限制已是最新.${NC}"
+    fi
+
+    echo -e "${GREEN}系统优化应用完成.${NC}"
     return 0
 }
 
@@ -152,31 +219,41 @@ save_install_details() {
 
 get_user_input_no_xray_deps() {
     echo -e "\n${BLUE}请输入 Reality 配置参数 (无需Xray依赖):${NC}"
+    
+    # --- SNI 输入 ---
     local prompt_sni="1. 请输入 SNI (当前: ${current_sni:-$DEFAULT_SNI}, 直接回车使用显示值): "
     read -rp "$prompt_sni" user_sni_input </dev/tty; final_sni=${user_sni_input:-${current_sni:-$DEFAULT_SNI}}
     if [[ -z "$final_sni" ]]; then echo -e "${RED}SNI 不能为空.${NC}"; return 1; fi
     echo -e "${GREEN}SNI 设置为: ${final_sni}${NC}"; final_dest_server="${final_sni}:443"; echo -e "${GREEN}目标服务器 (dest) 将自动设置为: ${final_dest_server}${NC}"
 
-    echo -e "\n2. 请选择 Reality 监听端口:"
-    local port_option1_display="${current_listen_port:-$DEFAULT_LISTEN_PORT_OPTION1}"
-    echo -e "   1) $port_option1_display (当前/默认推荐)"; echo -e "   2) 10000-60000 之间的随机端口"; echo -e "   3) 自定义端口"
-    read -rp "   请输入选项 [1-3], 或直接输入具体端口号 (直接回车默认使用 $port_option1_display): " port_choice </dev/tty
-    if [[ -z "$port_choice" ]]; then final_listen_port=$port_option1_display
-    elif [[ "$port_choice" == "1" ]]; then final_listen_port=$port_option1_display
-    elif [[ "$port_choice" == "2" ]]; then final_listen_port=$(shuf -i 10000-60000 -n 1); echo -e "${GREEN}   已选择随机端口: $final_listen_port${NC}"
-    elif [[ "$port_choice" == "3" ]]; then while true; do read -rp "   请输入自定义端口 (1-65535): " custom_port </dev/tty; if [[ "$custom_port" =~ ^[0-9]+$ ]] && [ "$custom_port" -ge 1 ] && [ "$custom_port" -le 65535 ]; then final_listen_port=$custom_port; break; else echo -e "${YELLOW}   无效的端口号...${NC}"; fi; done
-    elif [[ "$port_choice" =~ ^[0-9]+$ ]] && [ "$port_choice" -ge 1 ] && [ "$port_choice" -le 65535 ]; then final_listen_port=$port_choice
-    else echo -e "${YELLOW}   无效的选择...将使用端口 $port_option1_display.${NC}"; final_listen_port=$port_option1_display; fi
-    echo -e "${GREEN}监听端口设置为: $final_listen_port${NC}"
+    # --- 端口输入 (已简化) ---
+    local port_prompt_default="${current_listen_port:-$DEFAULT_LISTEN_PORT_OPTION1}"
+    local prompt_port=$'\n'"2. 请输入 Reality 监听端口 (当前/默认: $port_prompt_default, 'random'可生成随机端口): "
+    read -rp "$prompt_port" user_port_input </dev/tty
+    user_port_input=${user_port_input:-$port_prompt_default}
+    
+    if [[ "$user_port_input" == "random" ]]; then
+        final_listen_port=$(shuf -i 10000-60000 -n 1)
+        echo -e "${GREEN}   已选择随机端口: $final_listen_port${NC}"
+    elif [[ "$user_port_input" =~ ^[0-9]+$ ]] && [ "$user_port_input" -ge 1 ] && [ "$user_port_input" -le 65535 ]; then
+        final_listen_port=$user_port_input
+    else
+        echo -e "${YELLOW}   无效输入...将使用端口 $port_prompt_default.${NC}"
+        final_listen_port=$port_prompt_default
+    fi
+    echo -e "${GREEN}监听端口设置为: ${final_listen_port}${NC}"
 
-    local prompt_uuid=$'\n'"3. 请输入 UUID (当前: ${current_user_uuid:-留空将自动生成}, 留空则自动生成/使用当前值): "
+    # --- UUID 输入 ---
+    local prompt_uuid=$'\n'"3. 请输入 UUID (当前: ${current_user_uuid:-自动生成}, 留空则自动生成/使用当前值): "
     read -rp "$prompt_uuid" user_uuid_input </dev/tty; final_user_uuid_placeholder=${user_uuid_input:-${current_user_uuid:-"AUTO_GENERATE"}} 
     echo -e "${GREEN}UUID 行为设置为: ${final_user_uuid_placeholder}${NC}"
 
-    local prompt_short_id=$'\n'"4. 请输入 Short ID (当前: ${current_short_id_for_link:-留空将自动生成}, 逗号分隔, 留空则自动生成/使用当前值): "
+    # --- Short ID 输入 ---
+    local prompt_short_id=$'\n'"4. 请输入 Short ID (当前: ${current_short_id_for_link:-自动生成}, 逗号分隔, 留空则自动生成/使用当前值): "
     read -rp "$prompt_short_id" short_ids_input_str </dev/tty; final_short_id_placeholder=${short_ids_input_str:-${current_short_id_for_link:-"AUTO_GENERATE"}}
     echo -e "${GREEN}Short ID 行为设置为: ${final_short_id_placeholder}${NC}"
 
+    # --- 指纹输入 ---
     echo -e $'\n'"5. 请选择客户端 TLS 指纹 (Fingerprint/fp):"
     local fp_to_display_default="${current_fingerprint:-$DEFAULT_FP_OPTION}"
     for i in "${!AVAILABLE_FPS[@]}"; do local opt_num=$((i+1)); local opt_name="${AVAILABLE_FPS[$i]}"; if [[ "$opt_name" == "$fp_to_display_default" ]]; then echo -e "   $opt_num) $opt_name (当前/默认)"; else echo -e "   $opt_num) $opt_name"; fi; done
@@ -201,9 +278,11 @@ generate_reality_keys_interactive() {
 create_xray_config_interactive() {
     echo -e "\n${BLUE}正在创建 Xray 配置文件: $XRAY_CONFIG_FILE ${NC}"
     mkdir -p "$XRAY_CONFIG_PATH"
+    # 使用"最佳配置": vless + xtls-rprx-vision + reality
     cat << EOF > "$XRAY_CONFIG_FILE"
 {
-  "log": {"loglevel": "warning"}, "routing": {"domainStrategy": "AsIs", "rules": [{"type": "field", "outboundTag": "direct", "protocol": ["bittorrent"]}, {"type": "field", "outboundTag": "block", "protocol": ["stun", "quic"]}]},
+  "log": {"loglevel": "warning"}, 
+  "routing": {"domainStrategy": "AsIs", "rules": [{"type": "field", "outboundTag": "direct", "protocol": ["bittorrent"]}, {"type": "field", "outboundTag": "block", "protocol": ["stun", "quic"]}]},
   "inbounds": [{"listen": "0.0.0.0", "port": ${final_listen_port}, "protocol": "vless", "settings": {"clients": [{"id": "${final_user_uuid}", "flow": "xtls-rprx-vision"}], "decryption": "none"}, "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {"show": false, "dest": "${final_dest_server}", "xver": 0, "serverNames": ["${final_sni}"], "privateKey": "${final_private_key}", "minClientVer": "", "maxClientVer": "", "maxTimeDiff": 60000, "shortIds": [${final_short_id_for_config_array}]}}, "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}}],
   "outbounds": [{"protocol": "freedom", "tag": "direct"}, {"protocol": "blackhole", "tag": "block"}]
 }
@@ -292,6 +371,10 @@ install_reality() {
     echo -e "\n${BLUE}阶段 2: 开始安装环境和配置服务...${NC}"
     check_os_compatibility || { return; }
     install_dependencies || { echo -e "${RED}依赖安装失败, 中止安装.${NC}"; return; }
+    
+    # --- 新增：自动应用系统优化 ---
+    enable_system_optimizations || { echo -e "${YELLOW}系统优化步骤出现问题, 但安装将继续...${NC}"; }
+    
     install_xray_core || { echo -e "${RED}Xray核心安装失败, 中止安装.${NC}"; return; }
 
     if [[ "$final_user_uuid_placeholder" == "AUTO_GENERATE" ]]; then
@@ -340,7 +423,7 @@ view_configuration() {
 modify_configuration() {
     echo -e "\n${BLUE}--- 修改 Reality 配置 ---${NC}"
     if ! is_managed_install; then echo -e "${YELLOW}未找到由本脚本管理的 Reality 安装信息. 请先安装.${NC}"; return; fi
-    echo -e "${YELLOW}这将重新配置 Reality 服务, 但不会重装依赖或 Xray 核心 (除非Xray核心需要更新).${NC}"
+    echo -e "${YELLOW}这将重新配置 Reality 服务, 但不会重装依赖.${NC}"
     echo -e "${YELLOW}当前的 Reality 密钥对将会被重新生成.${NC}"
 
     load_install_details 
@@ -362,7 +445,7 @@ modify_configuration() {
     if [[ "$confirm_mods" =~ ^[Nn]$ ]]; then echo -e "${BLUE}修改取消. 返回主菜单.${NC}"; return; fi
 
     echo -e "\n${BLUE}正在应用修改...${NC}"
-    install_xray_core || { echo -e "${RED}Xray核心更新失败, 中止修改.${NC}"; return; }
+    install_xray_core || { echo -e "${RED}Xray核心更新失败, 中止修改.${NC}"; return; } # 确保 Xray 是最新的
 
     if [[ "$final_user_uuid_placeholder" == "AUTO_GENERATE" ]]; then
         final_user_uuid=$($XRAY_INSTALL_PATH uuid); echo -e "${GREEN}已自动生成 UUID: $final_user_uuid${NC}"
@@ -424,6 +507,7 @@ main_menu() {
     clear
     echo -e "${BLUE}=============================================${NC}"
     echo -e "${GREEN}    Xray Reality 代理管理脚本 v${SCRIPT_VERSION}${NC}"
+    echo -e "${GREEN}      (默认端口: ${DEFAULT_LISTEN_PORT_OPTION1}, 带 BBR 优化)${NC}"
     echo -e "${BLUE}=============================================${NC}"
     echo -e "当前日期: $(date +"%Y-%m-%d %A")"
     echo -e "---------------------------------------------"
@@ -440,11 +524,12 @@ main_menu() {
     echo -e "   ${GREEN}1)${NC} 安装 Reality 代理 (若已安装则为覆盖安装)"
     echo -e "   ${GREEN}2)${NC} 查看当前配置"
     echo -e "   ${GREEN}3)${NC} 修改 Reality 配置"
-    echo -e "   ${RED}4)${NC} 卸载 Reality 代理"
+    echo -e "   ${YELLOW}4)${NC} 应用系统优化 (BBR等)"
+    echo -e "   ${RED}5)${NC} 卸载 Reality 代理"
     echo -e "---------------------------------------------"
     echo -e "   ${YELLOW}0)${NC} 退出脚本"
     echo -e "---------------------------------------------"
-    read -rp "请输入选项 [0-4]: " choice </dev/tty # <--- 强制从TTY读取
+    read -rp "请输入选项 [0-5]: " choice </dev/tty # <--- 强制从TTY读取
 
     local post_action_pause=false 
 
@@ -452,7 +537,8 @@ main_menu() {
         1) install_reality; post_action_pause=true ;; 
         2) view_configuration; post_action_pause=true ;; 
         3) modify_configuration; post_action_pause=true ;;
-        4) uninstall_reality; post_action_pause=true ;; 
+        4) enable_system_optimizations; post_action_pause=true ;; # <--- 新增
+        5) uninstall_reality; post_action_pause=true ;; # <--- 编号+1
         0) echo -e "${GREEN}感谢使用, 正在退出...${NC}"; exit 0 ;;
         *) 
             echo -e "${RED}无效选项! 请重新输入.${NC}"; sleep 2;
