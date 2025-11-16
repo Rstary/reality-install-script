@@ -1,19 +1,11 @@
 #!/bin/bash
 
 # Xray Reality 管理脚本
-# 版本: 2.0.4-mod-final
-# 最后更新: 2025-10-26
-# by fs (修复 curl | bash 时的 read 问题)
-# 针对 Debian 13 优化, 默认端口 8443, 增加 BBR 及系统优化
-# v2.0.1: 增强了 xray uuid 和 x25519 命令的错误捕获
-# v2.0.2: 适配新版 xray x25519 的输出格式 (PrivateKey: 和 Password:), 修复公钥解析失败的问题
-# v2.0.2-mod: 修复双栈VPS获取IP的问题, 默认提供 v4 和 v6 两个链接
-# v2.0.3-mod-gai: 增加设置服务器 IP 栈优先级 (v4/v6) 的功能
-# v2.0.4-mod-final: 修正 "listen" 地址为 "::" (实现真正的双栈监听), 修正 "bittorrent" 拼写错误
 
-# --- 全局常量和默认值 ---
-SCRIPT_VERSION="2.0.4-mod-final"
-DEFAULT_SNI="genshin.hoyoverse.com"
+
+# --- 全局常量和默认值 (用户修改) ---
+SCRIPT_VERSION="2.0.4-mod-final-user-custom"
+DEFAULT_SNI="amd.com" # <--- 已修改为 amd.com
 DEFAULT_LISTEN_PORT_OPTION1="8443"
 DEFAULT_FP_OPTION="chrome"
 AVAILABLE_FPS=("chrome" "firefox" "safari" "edge" "ios" "android" "random")
@@ -107,7 +99,7 @@ install_dependencies() {
     return 0
 }
 
-# --- 系统优化函数 ---
+# --- 系统优化函数 (用户修改) ---
 enable_system_optimizations() {
     echo -e "\n${BLUE}--- 正在应用系统优化 (BBR, TCP, 文件描述符) ---${NC}"
     local sysctl_conf="/etc/sysctl.conf"
@@ -115,23 +107,44 @@ enable_system_optimizations() {
     local optimizations_applied=false
     local limits_applied=false
 
-    # BBR 和 TCP 优化
+    # BBR 和 TCP 优化 (根据用户请求更新)
     local sysctl_settings=(
+        "fs.file-max=6815744"
+        "net.ipv4.tcp_no_metrics_save=1"
+        "net.ipv4.tcp_ecn=0"
+        "net.ipv4.tcp_frto=0"
+        "net.ipv4.tcp_mtu_probing=0"
+        "net.ipv4.tcp_rfc1337=0"
+        "net.ipv4.tcp_sack=1"
+        "net.ipv4.tcp_fack=1"
+        "net.ipv4.tcp_window_scaling=1"
+        "net.ipv4.tcp_adv_win_scale=1"
+        "net.ipv4.tcp_moderate_rcvbuf=1"
+        "net.core.rmem_max=33554432"
+        "net.core.wmem_max=33554432"
+        "net.ipv4.tcp_rmem=4096 87380 33554432"
+        "net.ipv4.tcp_wmem=4096 16384 33554432"
+        "net.ipv4.udp_rmem_min=8192"
+        "net.ipv4.udp_wmem_min=8192"
+        "net.ipv4.ip_forward=1"
+        "net.ipv4.conf.all.route_localnet=1"
+        "net.ipv4.conf.all.forwarding=1"
+        "net.ipv4.conf.default.forwarding=1"
         "net.core.default_qdisc=fq"
         "net.ipv4.tcp_congestion_control=bbr"
-        "net.ipv4.tcp_fastopen=3"
-        "net.ipv4.tcp_tw_reuse=1"
-        "net.ipv4.tcp_fin_timeout=30"
-        "net.ipv4.ip_local_port_range=10000 65000"
+        "net.ipv6.conf.all.forwarding=1"
+        "net.ipv6.conf.default.forwarding=1"
+        "net.ipv6.conf.all.accept_ra=2"
     )
     
     # 检查并应用 sysctl 设置
-    echo -e "${BLUE}正在配置 BBR 和 TCP 参数...${NC}"
+    echo -e "${BLUE}正在配置 BBR 和 TCP 参数 (根据用户自定义列表)...${NC}"
     for setting in "${sysctl_settings[@]}"; do
-        if ! grep -qF "$setting" "$sysctl_conf"; then
-            echo "$setting" >> "$sysctl_conf"
-            optimizations_applied=true
-        fi
+        # 先移除可能存在的旧行, 避免重复
+        sed -i -E "/^[[:space:]]*$(echo $setting | sed -e 's/[]\/$*.^|[]/\\&/g' | cut -d'=' -f1)[[:space:]]*=.*$/d" "$sysctl_conf"
+        # 添加新行
+        echo "$setting" >> "$sysctl_conf"
+        optimizations_applied=true
     done
 
     if $optimizations_applied; then
@@ -637,7 +650,7 @@ manage_ip_priority() {
             
             # 检查是否被注释
             if grep -qE "^[[:space:]]*#[[:space:]]*${IPV4_PRECEDENCE_LINE}" "$GAI_CONF_FILE"; then
-                echo -e "${BLUE}在 ${GAI_CONF_FILE} 中找到已注释的行, 正在取消注释...${NC}"
+                echo -e "${BLUE}在 ${GAI_CONF_FILE} 中找到已注释的行, GNC}"
                 sed -i -E "s/^[[:space:]]*#[[:space:]]*${IPV4_PRECEDENCE_LINE}/${IPV4_PRECEDENCE_LINE}/" "$GAI_CONF_FILE"
             # 检查是否已存在且未被注释
             elif grep -qE "^[[:space:]]*${IPV4_PRECEDENCE_LINE}" "$GAI_CONF_FILE"; then
