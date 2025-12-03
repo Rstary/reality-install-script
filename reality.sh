@@ -4,7 +4,7 @@
 
 
 # --- 全局常量和默认值 (用户修改) ---
-SCRIPT_VERSION="2.0.4-mod-final-user-custom"
+SCRIPT_VERSION="2.0.5-bbr-fix"
 DEFAULT_SNI="amd.com" # <--- 已修改为 amd.com
 DEFAULT_LISTEN_PORT_OPTION1="8443"
 DEFAULT_FP_OPTION="chrome"
@@ -99,66 +99,13 @@ install_dependencies() {
     return 0
 }
 
-# --- 系统优化函数 (用户修改) ---
+# --- 系统优化函数 (已修改: 适配 Debian 13 + 自定义参数) ---
 enable_system_optimizations() {
     echo -e "\n${BLUE}--- 正在应用系统优化 (BBR, TCP, 文件描述符) ---${NC}"
-    local sysctl_conf="/etc/sysctl.conf"
+
+    # 1. 配置文件描述符限制 (limits.conf)
     local limits_conf="/etc/security/limits.conf"
-    local optimizations_applied=false
     local limits_applied=false
-
-    # BBR 和 TCP 优化 (根据用户请求更新)
-    local sysctl_settings=(
-        "fs.file-max=6815744"
-        "net.ipv4.tcp_no_metrics_save=1"
-        "net.ipv4.tcp_ecn=0"
-        "net.ipv4.tcp_frto=0"
-        "net.ipv4.tcp_mtu_probing=0"
-        "net.ipv4.tcp_rfc1337=0"
-        "net.ipv4.tcp_sack=1"
-        "net.ipv4.tcp_fack=1"
-        "net.ipv4.tcp_window_scaling=1"
-        "net.ipv4.tcp_adv_win_scale=1"
-        "net.ipv4.tcp_moderate_rcvbuf=1"
-        "net.core.rmem_max=33554432"
-        "net.core.wmem_max=33554432"
-        "net.ipv4.tcp_rmem=4096 87380 33554432"
-        "net.ipv4.tcp_wmem=4096 16384 33554432"
-        "net.ipv4.udp_rmem_min=8192"
-        "net.ipv4.udp_wmem_min=8192"
-        "net.ipv4.ip_forward=1"
-        "net.ipv4.conf.all.route_localnet=1"
-        "net.ipv4.conf.all.forwarding=1"
-        "net.ipv4.conf.default.forwarding=1"
-        "net.core.default_qdisc=fq"
-        "net.ipv4.tcp_congestion_control=bbr"
-        "net.ipv6.conf.all.forwarding=1"
-        "net.ipv6.conf.default.forwarding=1"
-        "net.ipv6.conf.all.accept_ra=2"
-    )
-    
-    # 检查并应用 sysctl 设置
-    echo -e "${BLUE}正在配置 BBR 和 TCP 参数 (根据用户自定义列表)...${NC}"
-    for setting in "${sysctl_settings[@]}"; do
-        # 先移除可能存在的旧行, 避免重复
-        sed -i -E "/^[[:space:]]*$(echo $setting | sed -e 's/[]\/$*.^|[]/\\&/g' | cut -d'=' -f1)[[:space:]]*=.*$/d" "$sysctl_conf"
-        # 添加新行
-        echo "$setting" >> "$sysctl_conf"
-        optimizations_applied=true
-    done
-
-    if $optimizations_applied; then
-        echo -e "${GREEN}Sysctl 配置已更新. 正在应用...${NC}"
-        if sysctl -p &>/dev/null; then
-            echo -e "${GREEN}Sysctl 设置已成功应用.${NC}"
-        else
-            echo -e "${YELLOW}Sysctl 设置应用失败. 可能需要重启.${NC}"
-        fi
-    else
-        echo -e "${GREEN}Sysctl (BBR等) 设置已是最新.${NC}"
-    fi
-
-    # 文件描述符限制
     echo -e "${BLUE}正在配置文件描述符限制...${NC}"
     local limit_settings=(
         "* soft nofile 65536"
@@ -180,6 +127,61 @@ enable_system_optimizations() {
         echo -e "${BLUE}(Xray 服务将通过 systemd 配置获得高限制, 不受此影响)${NC}"
     else
         echo -e "${GREEN}文件描述符限制已是最新.${NC}"
+    fi
+
+    # 2. 配置 Sysctl (BBR & 网络优化) - 核心修改部分
+    # 使用 /etc/sysctl.d/99-reality-custom.conf 确保在 Debian 13 上正确加载
+    local sysctl_file="/etc/sysctl.d/99-reality-custom.conf"
+    
+    echo -e "${BLUE}正在配置 BBR 和网络参数 (写入 ${sysctl_file})...${NC}"
+
+    # 写入哥哥指定的详细参数
+    cat << EOF > "$sysctl_file"
+fs.file-max = 6815744
+net.ipv4.tcp_no_metrics_save=1
+net.ipv4.tcp_ecn=0
+net.ipv4.tcp_frto=0
+net.ipv4.tcp_mtu_probing=0
+net.ipv4.tcp_rfc1337=0
+net.ipv4.tcp_sack=1
+net.ipv4.tcp_fack=1
+net.ipv4.tcp_window_scaling=1
+net.ipv4.tcp_adv_win_scale=1
+net.ipv4.tcp_moderate_rcvbuf=1
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
+net.ipv4.tcp_rmem=4096 87380 33554432
+net.ipv4.tcp_wmem=4096 16384 33554432
+net.ipv4.udp_rmem_min=8192
+net.ipv4.udp_wmem_min=8192
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.route_localnet=1
+net.ipv4.conf.all.forwarding=1
+net.ipv4.conf.default.forwarding=1
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv6.conf.all.forwarding=1
+net.ipv6.conf.default.forwarding=1
+net.ipv6.conf.all.accept_ra = 2
+EOF
+
+    echo -e "${GREEN}Sysctl 配置文件已创建成功: ${sysctl_file}${NC}"
+    
+    echo -e "${BLUE}正在加载新的内核参数 (sysctl --system)...${NC}"
+    # 使用 --system 确保加载所有目录下的配置
+    if sysctl --system &>/dev/null; then
+        echo -e "${GREEN}系统优化参数已成功应用!${NC}"
+        
+        # 检查 BBR 状态
+        local bbr_status=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')
+        if [[ "$bbr_status" == "bbr" ]]; then
+            echo -e "${GREEN}验证成功: TCP BBR 已开启 (当前状态: ${bbr_status}).${NC}"
+        else
+            echo -e "${YELLOW}警告: BBR 似乎未立即生效 (当前: ${bbr_status}). 建议重启服务器.${NC}"
+        fi
+    else
+        echo -e "${RED}应用 Sysctl 设置时出错. 请检查日志.${NC}"
+        return 1
     fi
 
     echo -e "${GREEN}系统优化应用完成.${NC}"
